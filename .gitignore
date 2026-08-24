@@ -1,0 +1,6 @@
+node_modules/
+.dsh-home/
+.harness/
+.DS_Store
+*.dbg*
+pnpm-lock.yaml

@@ -1,0 +1,44 @@
+# gmail-dsh bundle layer.
+#
+# Mounted by listing "gmail-dsh" in the profile's `dsh.profile.bundles`
+# (see README). It inserts the single plugin row; per DSH doctrine the row
+# config carries references only — never secrets. The OAuth client
+# id/secret values live in the credential store (~/.dsh/.credentials.yaml)
+# or the process environment under the names named below.
+- insert:
+    - id: gmail
+      name: 'gmail-dsh'
+      config:
+        # Names of the credential refs holding the Google OAuth client.
+        clientIdEnv: GMAIL_OAUTH_CLIENT_ID
+        clientSecretEnv: GMAIL_OAUTH_CLIENT_SECRET
+        # Literal values are a discouraged fallback (this file is not a
+        # secret home); leave empty to use the refs only.
+        clientId: ''
+        clientSecret: ''
+        # Scopes are deliberately NOT restated here: an explicit value in a
+        # patch layer overrides the code defaults, so a restated list would
+        # silently pin whatever the code had at bundle-authoring time (the
+        # 2026-08-24 `openid` regression: a stale list here overrode the
+        # fixed defaults and the userinfo lookup that reads the account
+        # email failed with 401 on every restart). The single source of
+        # truth is DEFAULT_SCOPES in src/config.js; to customize, add a
+        # `scopes` key to YOUR OWN profile patch layer (applied after this
+        # one).
+        # One-shot loopback callback for the OAuth code. Google's
+        # Desktop client type accepts http://127.0.0.1:<any port>, so no
+        # fixed port or pre-registered redirect is required.
+        callbackHost: '127.0.0.1'
+        callbackPath: '/gmail/callback'
+        # Preferred account when several are authorized ('' = first one).
+        defaultAccount: ''
+        # How long /gmail auth waits for the browser to complete.
+        authTimeoutMs: 300000
+        # Approval gating for mutating tools (reads never prompt).
+        requireApproval:
+          send: true
+          labels: true
+        # Model-facing context section (empty = zero tokens while idle).
+        context:
+          enabled: true
+          order: 117

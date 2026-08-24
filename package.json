@@ -1,0 +1,41 @@
+{
+  "name": "gmail-dsh",
+  "version": "0.1.3",
+  "description": "Native Gmail integration for the DeepSeek Harness: Google OAuth 2.0 (PKCE) over the DSH credential store, native gmail_* tools, approval-gated send and label operations, the /gmail command, and a cache-safe model context section.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "test.mjs"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "gmail",
+    "oauth"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
