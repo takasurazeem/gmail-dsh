@@ -159,11 +159,15 @@ export function registerTools(ctx, deps) {
         },
         additionalProperties: false,
       },
-      render: (_args, v) =>
+      // `q` is an *input*; it is not in the output schema above, and
+      // `additionalProperties: false` means the runtime strips anything
+      // undeclared — so reading `v.q` here rendered "undefined" in the
+      // empty-result message. The render already receives the args.
+      render: (args, v) =>
         text(
           v.messages.length
             ? `Gmail results for ${v.account} (newest first):\n${v.messages.map(messageLine).join('\n')}`
-            : `No messages matched "${v.q}" for ${v.account}.`,
+            : `No messages matched "${args.q}" for ${v.account}.`,
         ),
     },
     timeoutMs: 60_000,

@@ -1067,6 +1067,59 @@ if (dshTools) {
     assert.equal(value.live, false);
     assert.match(value.error, /network down/);
   });
+
+  // Regression 2026-09-29: the empty-result render read `v.q`, but `q` is an
+  // input and the output schema declares only account/pageToken/messages with
+  // `additionalProperties: false` — so the runtime stripped it and the message
+  // rendered `No messages matched "undefined"`. The render must use its args.
+  await test('gmail_search render names the query on an empty result', async () => {
+    const { registerTools } = await import('./src/tools.js');
+    const registered = [];
+    const ctx = { tools: { register: (def) => registered.push(def) } };
+    registerTools(ctx, {
+      config: normalizeConfig({}),
+      creds: fakeCreds({ 'gmail-dsh/a-b-com': { kind: 'grant', payload: { email: 'a@b.com' } } }),
+      gmail: {
+        ...fakeGmail(),
+        searchMessages: async () => ({ messages: [] }),
+      },
+      resolveAccount: async () => 'a@b.com',
+      listAccounts: async () => ['a@b.com'],
+      checkClient: async () => ({ complete: true }),
+      verify: async () => ({ ok: true, error: '' }),
+    });
+    const def = registered.find((d) => d.name === 'gmail_search');
+    const value = await def.execute({ q: 'from:nobody@example.com' }, { signal: new AbortController().signal });
+    assert.equal(value.messages.length, 0);
+    const rendered = def.output.render({ q: 'from:nobody@example.com' }, value).map((p) => p.text).join('');
+    assert.match(rendered, /from:nobody@example\.com/);
+    assert.doesNotMatch(rendered, /undefined/);
+  });
+
+  // Every render must only read fields its own output schema declares;
+  // `additionalProperties: false` strips the rest.
+  await test('tool renders read only fields their output schema declares', async () => {
+    const { registerTools } = await import('./src/tools.js');
+    const registered = [];
+    const ctx = { tools: { register: (def) => registered.push(def) } };
+    registerTools(ctx, {
+      config: normalizeConfig({}),
+      creds: fakeCreds({ 'gmail-dsh/a-b-com': { kind: 'grant', payload: { email: 'a@b.com' } } }),
+      gmail: fakeGmail(),
+      resolveAccount: async () => 'a@b.com',
+      listAccounts: async () => ['a@b.com'],
+      checkClient: async () => ({ complete: true }),
+      verify: async () => ({ ok: true, error: '' }),
+    });
+    for (const def of registered) {
+      const props = new Set(Object.keys(def.output?.schema?.properties ?? {}));
+      const src = String(def.output?.render ?? '');
+      const used = [...src.matchAll(/\bv\.([a-zA-Z]+)/g)].map((m) => m[1]);
+      for (const field of used) {
+        assert.ok(props.has(field), `${def.name} render reads v.${field}, not in its output schema`);
+      }
+    }
+  });
 } else {
   await test('registerTools: skipped (dsh-tools not resolvable in this checkout)', () => {});
 }
