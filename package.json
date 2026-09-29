@@ -1,6 +1,6 @@
 {
   "name": "gmail-dsh",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "Native Gmail integration for the DeepSeek Harness: Google OAuth 2.0 (PKCE) over the DSH credential store, native gmail_* tools, approval-gated send and label operations, the /gmail command, and a cache-safe model context section.",
   "type": "module",
   "main": "index.js",

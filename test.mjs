@@ -366,6 +366,62 @@ await test('refreshAccessToken surfaces Google error details', async () => {
   }
 });
 
+// Regression: Google's invalid_grant body is {"error":"invalid_grant",
+// "error_description":"Bad Request"}. Preferring error_description reported
+// the useless "Bad Request" and buried the actionable error code.
+await test('refreshAccessToken leads with the error code when the description is useless', async () => {
+  const unstub = stubFetch(async () => ({
+    ok: false,
+    status: 400,
+    text: async () => '{"error":"invalid_grant","error_description":"Bad Request"}',
+  }));
+  try {
+    await assert.rejects(
+      refreshAccessToken({ refreshToken: 'rt', clientId: 'id', clientSecret: 'sec' }),
+      (err) => {
+        assert.match(err.message, /invalid_grant/);
+        assert.match(err.message, /Bad Request/);
+        assert.match(err.message, /\/gmail auth/);
+        return true;
+      },
+    );
+  } finally {
+    unstub();
+  }
+});
+
+await test('refreshAccessToken names the invalid_client remedy', async () => {
+  const unstub = stubFetch(async () => ({
+    ok: false,
+    status: 401,
+    text: async () => '{"error":"invalid_client","error_description":"The OAuth client was not found."}',
+  }));
+  try {
+    await assert.rejects(
+      refreshAccessToken({ refreshToken: 'rt', clientId: 'id', clientSecret: 'sec' }),
+      /invalid_client[\s\S]*GMAIL_OAUTH_CLIENT_ID/,
+    );
+  } finally {
+    unstub();
+  }
+});
+
+await test('refreshAccessToken falls back to the raw body when there is no JSON', async () => {
+  const unstub = stubFetch(async () => ({
+    ok: false,
+    status: 502,
+    text: async () => '<html>bad gateway</html>',
+  }));
+  try {
+    await assert.rejects(
+      refreshAccessToken({ refreshToken: 'rt', clientId: 'id', clientSecret: 'sec' }),
+      /502[\s\S]*bad gateway/,
+    );
+  } finally {
+    unstub();
+  }
+});
+
 await test('fetchUserInfo returns email/name/sub', async () => {
   const unstub = stubFetch(async (url, init) => {
     assert.equal(url, USERINFO_URL);
@@ -576,20 +632,97 @@ await test('client: 200 returns parsed json and the token is sent', async () => 
       return 'tok-1';
     },
   });
+  // Regression 2026-09-29: `messages.list` carries no headers, so search now
+  // hydrates each hit with `messages.get?format=metadata`. The list call is
+  // first; the per-id hydration follows.
+  const seen = [];
   const unstub = stubFetch(async (url, init) => {
-    assert.match(url, /^https:\/\/gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\?q=new&maxResults=5/);
     assert.equal(init.headers.authorization, 'Bearer tok-1');
+    seen.push(url);
+    if (/\/messages\?q=new/.test(url)) {
+      assert.match(url, /^https:\/\/gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\?q=new&maxResults=5/);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '{"messages":[{"id":"m1"}],"nextPageToken":"p2"}',
+      };
+    }
+    assert.match(url, /\/messages\/m1\?format=metadata/);
     return {
       ok: true,
       status: 200,
-      text: async () => '{"messages":[{"id":"m1"}],"nextPageToken":"p2"}',
+      text: async () =>
+        '{"id":"m1","payload":{"headers":[{"name":"From","value":"a@b.com"},{"name":"Subject","value":"Hi"}]}}',
     };
   });
   try {
     const res = await gmail.searchMessages('new', { maxResults: 5 });
     assert.equal(res.messages[0].id, 'm1');
     assert.equal(res.nextPageToken, 'p2');
-    assert.deepEqual(tokens, ['tok-1']);
+    assert.equal(seen.length, 2, 'list + one metadata hydration');
+    assert.ok(tokens.length >= 1);
+  } finally {
+    unstub();
+  }
+});
+
+await test('client: search hydrates headers for every hit (regression: blank rows)', async () => {
+  const gmail = createGmailClient({ getAccessToken: async () => 't' });
+  const hydrated = [];
+  const unstub = stubFetch(async (url) => {
+    if (/\/messages\?/.test(url)) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '{"messages":[{"id":"a"},{"id":"b"}]}',
+      };
+    }
+    const id = url.match(/\/messages\/([^?]+)/)[1];
+    hydrated.push(id);
+    assert.match(url, /format=metadata/);
+    assert.match(url, /metadataHeaders=From/);
+    // Regression 2026-09-29: an array query value must REPEAT the key.
+    // `new URLSearchParams(Object.entries({metadataHeaders:['From','To']}))`
+    // flattens to `metadataHeaders=From%2CTo`, which Gmail silently ignores —
+    // so every hydrated message came back with no headers at all.
+    assert.match(url, /metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date/);
+    assert.doesNotMatch(url, /metadataHeaders=[^&]*%2C/);
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        `{"id":"${id}","payload":{"headers":[{"name":"Subject","value":"S-${id}"}]}}`,
+    };
+  });
+  try {
+    const res = await gmail.searchMessages('x');
+    assert.deepEqual(hydrated.sort(), ['a', 'b']);
+    assert.equal(res.messages[0].payload.headers[0].value, 'S-a');
+  } finally {
+    unstub();
+  }
+});
+
+await test('client: an unreadable message does not fail the whole search', async () => {
+  const gmail = createGmailClient({ getAccessToken: async () => 't' });
+  const unstub = stubFetch(async (url) => {
+    if (/\/messages\?/.test(url)) {
+      return { ok: true, status: 200, text: async () => '{"messages":[{"id":"good"},{"id":"bad"}]}' };
+    }
+    if (/\/messages\/bad/.test(url)) {
+      return { ok: false, status: 404, text: async () => '{"error":{"message":"Not Found"}}' };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => '{"id":"good","payload":{"headers":[{"name":"Subject","value":"OK"}]}}',
+    };
+  });
+  try {
+    const res = await gmail.searchMessages('x');
+    assert.equal(res.messages.length, 2, 'both rows survive');
+    assert.equal(res.messages.find((m) => m.id === 'bad').id, 'bad');
+    assert.equal(res.messages.find((m) => m.id === 'good').payload.headers[0].value, 'OK');
   } finally {
     unstub();
   }
@@ -642,6 +775,66 @@ await test('client: 401 forces a refresh and retries exactly once', async () => 
     assert.deepEqual(res.labels, []);
     assert.deepEqual(calls, [false, true]);
     assert.equal(n, 2);
+  } finally {
+    unstub();
+  }
+});
+
+// Regression 2026-09-29: a 403 `insufficientPermissions` is a STALE cached
+// access token — one minted before a new scope was granted. Only 401 was
+// retried, so the plugin stayed broken after the user added gmail.modify
+// until the process restarted. It must refresh and retry exactly once.
+await test('client: 403 insufficient scopes forces a refresh and retries once', async () => {
+  const calls = [];
+  const gmail = createGmailClient({
+    getAccessToken: async ({ force }) => {
+      calls.push(Boolean(force));
+      return force ? 'fresh' : 'stale';
+    },
+  });
+  let n = 0;
+  const unstub = stubFetch(async (_url, init) => {
+    n += 1;
+    if (n === 1) {
+      assert.equal(init.headers.authorization, 'Bearer stale');
+      return {
+        ok: false,
+        status: 403,
+        text: async () =>
+          '{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED"}}',
+      };
+    }
+    assert.equal(init.headers.authorization, 'Bearer fresh');
+    return { ok: true, status: 200, text: async () => '{"labels":[]}' };
+  });
+  try {
+    const res = await gmail.listLabels();
+    assert.deepEqual(res.labels, []);
+    assert.deepEqual(calls, [false, true]);
+    assert.equal(n, 2);
+  } finally {
+    unstub();
+  }
+});
+
+// A genuine 403 (quota) must NOT be retried — it is not a stale-token signal.
+await test('client: a non-permission 403 is not retried', async () => {
+  const calls = [];
+  const gmail = createGmailClient({
+    getAccessToken: async ({ force }) => {
+      calls.push(Boolean(force));
+      return 'tok';
+    },
+  });
+  let n = 0;
+  const unstub = stubFetch(async () => {
+    n += 1;
+    return { ok: false, status: 403, text: async () => '{"error":{"message":"quota exceeded"}}' };
+  });
+  try {
+    await assert.rejects(gmail.listLabels(), /403.*quota exceeded/s);
+    assert.equal(n, 1, 'quota 403 must not trigger a retry');
+    assert.deepEqual(calls, [false]);
   } finally {
     unstub();
   }
@@ -805,6 +998,74 @@ if (dshTools) {
     for (const [method, account] of gmailCalls) {
       assert.equal(account, 'a@b.com', `client ${method} called without the resolved account`);
     }
+  });
+
+  // Regression 2026-09-28: gmail_status reported "Gmail authorized" from the
+  // stored record alone while every real call failed with invalid_grant. A
+  // stored grant proves only that an authorization once happened, so status
+  // must verify the token and say so plainly when it is dead.
+  await test('gmail_status reports a dead grant instead of claiming success', async () => {
+    const { registerTools } = await import('./src/tools.js');
+    const registered = [];
+    const ctx = { tools: { register: (def) => registered.push(def) } };
+    registerTools(ctx, {
+      config: normalizeConfig({}),
+      creds: fakeCreds({ 'gmail-dsh/a-b-com': { kind: 'grant', payload: { email: 'a@b.com' } } }),
+      gmail: fakeGmail(),
+      resolveAccount: async () => 'a@b.com',
+      listAccounts: async () => ['a@b.com'],
+      checkClient: async () => ({ complete: true }),
+      verify: async () => ({ ok: false, error: 'OAuth request failed (400): invalid_grant: Bad Request' }),
+    });
+    const def = registered.find((d) => d.name === 'gmail_status');
+    const value = await def.execute({}, { signal: new AbortController().signal });
+    assert.equal(value.authorized, true);
+    assert.equal(value.live, false);
+    assert.match(value.error, /invalid_grant/);
+    const rendered = def.output.render({}, value).map((p) => p.text).join('');
+    assert.match(rendered, /no longer works/);
+    assert.match(rendered, /\/gmail auth/);
+    assert.doesNotMatch(rendered, /^Gmail authorized:/);
+  });
+
+  await test('gmail_status reports a live grant as authorized', async () => {
+    const { registerTools } = await import('./src/tools.js');
+    const registered = [];
+    const ctx = { tools: { register: (def) => registered.push(def) } };
+    registerTools(ctx, {
+      config: normalizeConfig({}),
+      creds: fakeCreds({ 'gmail-dsh/a-b-com': { kind: 'grant', payload: { email: 'a@b.com' } } }),
+      gmail: fakeGmail(),
+      resolveAccount: async () => 'a@b.com',
+      listAccounts: async () => ['a@b.com'],
+      checkClient: async () => ({ complete: true }),
+      verify: async () => ({ ok: true, error: '' }),
+    });
+    const def = registered.find((d) => d.name === 'gmail_status');
+    const value = await def.execute({}, { signal: new AbortController().signal });
+    assert.equal(value.live, true);
+    assert.equal(value.error, '');
+    const rendered = def.output.render({}, value).map((p) => p.text).join('');
+    assert.match(rendered, /Gmail authorized: a@b\.com/);
+  });
+
+  await test('gmail_status tolerates a verify that throws', async () => {
+    const { registerTools } = await import('./src/tools.js');
+    const registered = [];
+    const ctx = { tools: { register: (def) => registered.push(def) } };
+    registerTools(ctx, {
+      config: normalizeConfig({}),
+      creds: fakeCreds({ 'gmail-dsh/a-b-com': { kind: 'grant', payload: { email: 'a@b.com' } } }),
+      gmail: fakeGmail(),
+      resolveAccount: async () => 'a@b.com',
+      listAccounts: async () => ['a@b.com'],
+      checkClient: async () => ({ complete: true }),
+      verify: async () => { throw new Error('network down'); },
+    });
+    const def = registered.find((d) => d.name === 'gmail_status');
+    const value = await def.execute({}, { signal: new AbortController().signal });
+    assert.equal(value.live, false);
+    assert.match(value.error, /network down/);
   });
 } else {
   await test('registerTools: skipped (dsh-tools not resolvable in this checkout)', () => {});

@@ -181,8 +181,22 @@ async function postForm(url, params, signal) {
     json = undefined;
   }
   if (!res.ok) {
-    const detail = json?.error_description || json?.error || text;
-    throw new Error(`OAuth request to ${url} failed (${res.status}): ${truncate(detail, 300)}`);
+    // Google's `invalid_grant` responses carry a useless description
+    // ("Bad Request"), so the machine-readable `error` code must lead:
+    // preferring `error_description` alone reported "Bad Request" and hid
+    // the one token that says what actually went wrong.
+    const code = typeof json?.error === 'string' ? json.error : '';
+    const desc = typeof json?.error_description === 'string' ? json.error_description : '';
+    const detail = [code, desc && desc !== code ? desc : ''].filter(Boolean).join(': ') || text;
+    // The two failures a user can actually act on get their remedy inline;
+    // every other OAuth error stays a plain report.
+    const hint =
+      code === 'invalid_grant'
+        ? ' — the stored refresh token is no longer valid (revoked, or expired: a Google OAuth app left in "Testing" publishing status expires refresh tokens after 7 days). Run /gmail auth to authorize again.'
+        : code === 'invalid_client'
+          ? ' — the OAuth client was rejected; check the GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_CLIENT_SECRET refs.'
+          : '';
+    throw new Error(`OAuth request to ${url} failed (${res.status}): ${truncate(detail, 300)}${hint}`);
   }
   return json ?? {};
 }

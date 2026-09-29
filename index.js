@@ -50,13 +50,18 @@ export function apply(ctx, rawConfig) {
   const tokenCache = new Map();
 
   // Synchronous snapshot for the context section (its text provider may
-  // not await).
-  const authState = { accounts: [] };
+  // not await). `dead` records accounts whose refresh token was rejected by
+  // a real call, so the context can stop claiming a broken grant works.
+  const authState = { accounts: [], dead: new Map() };
   let stateReady = Promise.resolve();
   function refreshAuthState() {
     stateReady = stateReady.then(async () => {
       try {
-        authState.accounts = await listAccounts(creds);
+        const accounts = await listAccounts(creds);
+        authState.accounts = accounts;
+        for (const email of [...authState.dead.keys()]) {
+          if (!accounts.includes(email)) authState.dead.delete(email);
+        }
       } catch {
         // Keep the last known state on a transient store failure.
       }
@@ -126,6 +131,24 @@ export function apply(ctx, rawConfig) {
     };
   }
 
+  // Live grant check for gmail_status: a stored record only proves an
+  // authorization once happened, so the only honest answer to "is Gmail
+  // connected?" is whether the refresh token still exchanges. `force`
+  // bypasses the in-process cache so a rotated/revoked token is seen.
+  async function verifyGrant(account) {
+    try {
+      await getAccessToken({ account, force: true });
+      authState.dead.delete(account);
+      return { ok: true, error: '' };
+    } catch (err) {
+      const message = String(err?.message || err);
+      // Only a rejected grant marks the account dead; a transient network
+      // failure must not, or the context would slander a working account.
+      if (/invalid_grant|not authorized/i.test(message)) authState.dead.set(account, message);
+      return { ok: false, error: message };
+    }
+  }
+
   registerTools(ctx, {
     config,
     creds,
@@ -133,6 +156,7 @@ export function apply(ctx, rawConfig) {
     resolveAccount,
     listAccounts: () => listAccounts(creds),
     checkClient,
+    verify: verifyGrant,
   });
 
   // Approval gate: mutating tools ask; reads pass through. The session
@@ -166,11 +190,17 @@ export function apply(ctx, rawConfig) {
           const accounts = authState.accounts;
           const client = await checkClient();
           const defaultAccount = config.defaultAccount || (accounts.length === 1 ? accounts[0] : '');
+          const target = defaultAccount || accounts[0];
+          // Report the live grant, not just the stored record: "authorized"
+          // over a revoked token is the report that misleads.
+          const probe = accounts.length ? await verifyGrant(target) : null;
           return {
             kind: 'success',
             text: [
               accounts.length
-                ? `Authorized: ${accounts.join(', ')}${defaultAccount ? ` (default: ${defaultAccount})` : ''}`
+                ? probe.ok
+                  ? `Authorized: ${accounts.join(', ')}${defaultAccount ? ` (default: ${defaultAccount})` : ''}`
+                  : `Stored authorization for ${accounts.join(', ')} no longer works — run /gmail auth. (${probe.error})`
                 : 'Not authorized — run /gmail auth.',
               client.complete ? 'OAuth client: configured.' : `OAuth client: NOT configured — set ${client.missing}.`,
               `Scopes: ${config.scopes.join(', ')}`,
@@ -306,6 +336,14 @@ export function apply(ctx, rawConfig) {
           config.defaultAccount && accounts.includes(config.defaultAccount)
             ? config.defaultAccount
             : accounts.join(', ');
+        // A dead grant is stated plainly: silently advertising a broken
+        // connection is what let every later call fail confusingly.
+        if (accounts.some((a) => authState.dead.has(a))) {
+          return [
+            `Gmail has a stored authorization for ${who}, but the grant was rejected by Google and Gmail calls will fail.`,
+            'Tell the user to run /gmail auth to authorize again.',
+          ].join(' ');
+        }
         return [
           `Gmail is connected for ${who} (scopes: ${config.scopes.join(', ')}).`,
           'Use gmail_search to find messages (Gmail query syntax, newest first), gmail_read for full text, gmail_send for outgoing mail, gmail_labels for label changes, and gmail_status for the setup state.',

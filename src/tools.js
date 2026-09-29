@@ -50,14 +50,15 @@ function messageLine(m) {
  *   resolveAccount(arg) — tool `account` param -> authorized email
  *   listAccounts()      -> string[] of authorized emails
  *   checkClient()       -> {complete, missing}
+ *   verify(account)     -> {ok, error?} live refresh-token check
  */
 export function registerTools(ctx, deps) {
-  const { config, creds, gmail, resolveAccount, listAccounts, checkClient } = deps;
+  const { config, creds, gmail, resolveAccount, listAccounts, checkClient, verify } = deps;
 
   ctx.tools.register(dt({
     name: 'gmail_status',
     description:
-      'Gmail authorization status for this harness: the authorized accounts, the default account, the OAuth scopes in use, and whether the Google OAuth client is configured. Call it first when unsure whether Gmail is set up.',
+      'Gmail authorization status for this harness: the authorized accounts, the default account, the OAuth scopes in use, whether the Google OAuth client is configured, and whether the stored grant still works (a live token check). Call it first when unsure whether Gmail is set up.',
     parameters: {},
     output: {
       schema: {
@@ -68,15 +69,28 @@ export function registerTools(ctx, deps) {
           defaultAccount: { type: 'string', required: true },
           scopes: { type: 'array', items: { type: 'string' }, required: true },
           clientConfigured: { type: 'boolean', required: true },
+          live: { type: 'boolean', required: true },
+          error: { type: 'string', required: true },
         },
         additionalProperties: false,
       },
-      render: (_args, v) =>
-        text(
-          v.authorized
-            ? `Gmail authorized: ${v.accounts.join(', ')}${v.defaultAccount ? ` (default ${v.defaultAccount})` : ''}. Scopes: ${v.scopes.join(', ')}.`
-            : `Gmail is not authorized. The user should run /gmail auth${v.clientConfigured ? '' : ' after configuring the Google OAuth client'}.`,
-        ),
+      render: (_args, v) => {
+        if (!v.authorized) {
+          return text(
+            `Gmail is not authorized. The user should run /gmail auth${v.clientConfigured ? '' : ' after configuring the Google OAuth client'}.`,
+          );
+        }
+        const who = `${v.accounts.join(', ')}${v.defaultAccount ? ` (default ${v.defaultAccount})` : ''}`;
+        // A stored record proves only that an authorization once happened.
+        // When the live check fails the grant is dead, and saying
+        // "authorized" here is what let every later call fail confusingly.
+        if (!v.live) {
+          return text(
+            `Gmail has a stored authorization for ${who}, but it no longer works: ${v.error} Run /gmail auth to authorize again.`,
+          );
+        }
+        return text(`Gmail authorized: ${who}. Scopes: ${v.scopes.join(', ')}.`);
+      },
     },
     timeoutMs: 10_000,
     isConcurrencySafe: () => true,
@@ -84,12 +98,26 @@ export function registerTools(ctx, deps) {
       const accounts = await listAccounts();
       const defaultAccount = config.defaultAccount || (accounts.length === 1 ? accounts[0] : '');
       const client = await checkClient();
+      let live = true;
+      let error = '';
+      if (accounts.length && typeof verify === 'function') {
+        try {
+          const probe = await verify(defaultAccount || accounts[0]);
+          live = probe?.ok !== false;
+          error = live ? '' : String(probe?.error || 'the stored grant was rejected');
+        } catch (err) {
+          live = false;
+          error = String(err?.message || err);
+        }
+      }
       return {
         authorized: accounts.length > 0,
         accounts,
         defaultAccount,
         scopes: config.scopes,
         clientConfigured: client.complete,
+        live,
+        error,
       };
     },
   }));
@@ -149,6 +177,8 @@ export function registerTools(ctx, deps) {
         account: acct,
         signal: exec.signal,
       });
+      // searchMessages hydrates each hit (messages.list returns only
+      // { id, threadId }), so headers are present here.
       const messages = (res.messages ?? []).map((m) => {
         const headers = m.payload?.headers ?? [];
         const first = (name) => {

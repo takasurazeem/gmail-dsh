@@ -128,7 +128,17 @@ export function createGmailClient({ getAccessToken }) {
       const params = query
         ? Object.entries(query).filter(([, v]) => v !== undefined && v !== null && v !== '')
         : [];
-      const url = GMAIL_API_BASE + path + (params.length ? `?${new URLSearchParams(params).toString()}` : '');
+      // Array values must repeat the key (metadataHeaders=From&metadataHeaders=To).
+      // `new URLSearchParams(Object.entries(...))` flattens an array to one
+      // comma-joined value, which Gmail silently ignores — the bug that made
+      // every search row render without a sender or subject.
+      const search = new URLSearchParams();
+      for (const [k, v] of params) {
+        if (Array.isArray(v)) for (const item of v) search.append(k, item);
+        else search.append(k, v);
+      }
+      const qs = search.toString();
+      const url = GMAIL_API_BASE + path + (qs ? `?${qs}` : '');
       return fetch(url, {
         method,
         headers: {
@@ -140,8 +150,26 @@ export function createGmailClient({ getAccessToken }) {
       });
     };
     let res = await doFetch(forceRefresh);
-    if (res.status === 401 && !forceRefresh) res = await doFetch(true);
-    if (!res.ok) {
+    if (!res.ok && !forceRefresh) {
+      const detail = await res.text();
+      // A 401 is an expired access token. A 403 `insufficientPermissions` is
+      // a *stale* one: the cached access token was minted before the user
+      // granted a new scope (e.g. gmail.modify added to the consent screen),
+      // so it carries the old scope set and every call fails until the token
+      // is re-minted. Both clear on a forced refresh; a genuine 403 quota
+      // error must not be retried, so the body decides.
+      const retryable =
+        res.status === 401 || /insufficient|PERMISSION_DENIED|ACCESS_TOKEN_SCOPE/i.test(detail);
+      if (retryable) {
+        res = await doFetch(true);
+        if (!res.ok) {
+          const retryDetail = await res.text();
+          throw new Error(`Gmail API ${method} ${path} failed (${res.status}): ${truncate(retryDetail, 400)}`);
+        }
+      } else {
+        throw new Error(`Gmail API ${method} ${path} failed (${res.status}): ${truncate(detail, 400)}`);
+      }
+    } else if (!res.ok) {
       const detail = await res.text();
       throw new Error(`Gmail API ${method} ${path} failed (${res.status}): ${truncate(detail, 400)}`);
     }
@@ -149,13 +177,49 @@ export function createGmailClient({ getAccessToken }) {
     return text ? JSON.parse(text) : {};
   };
 
+  // `messages.list` returns ONLY { id, threadId } — it has no format or
+  // metadataHeaders parameter (those belong to `messages.get`), so asking
+  // for them on the list call is silently ignored. Headers must therefore
+  // be hydrated with one `messages.get?format=metadata` per hit; without
+  // this every search row rendered as "unknown date / unknown sender".
+  const HEADER_NAMES = ['From', 'To', 'Subject', 'Date'];
+
+  async function hydrateMetadata(ids, opts) {
+    const out = new Array(ids.length);
+    const CONCURRENCY = 8;
+    let next = 0;
+    const worker = async () => {
+      while (next < ids.length) {
+        const i = next++;
+        try {
+          out[i] = await request(`/users/me/messages/${encodeURIComponent(ids[i])}`, {
+            query: { format: 'metadata', metadataHeaders: HEADER_NAMES },
+            signal: opts.signal,
+            account: opts.account,
+          });
+        } catch {
+          // A single unreadable message must not fail the whole search;
+          // leave it as a bare id so the row still renders.
+          out[i] = { id: ids[i] };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, ids.length) }, worker));
+    return out;
+  }
+
   return {
-    searchMessages: (q, opts = {}) =>
-      request('/users/me/messages', {
+    searchMessages: async (q, opts = {}) => {
+      const page = await request('/users/me/messages', {
         query: { q, maxResults: opts.maxResults ?? 20, pageToken: opts.pageToken },
         signal: opts.signal,
         account: opts.account,
-      }),
+      });
+      const ids = (page.messages ?? []).map((m) => m.id).filter(Boolean);
+      if (!ids.length) return page;
+      const full = await hydrateMetadata(ids, opts);
+      return { ...page, messages: full };
+    },
     getMessage: (messageId, opts = {}) =>
       request(`/users/me/messages/${encodeURIComponent(messageId)}`, {
         signal: opts.signal,
